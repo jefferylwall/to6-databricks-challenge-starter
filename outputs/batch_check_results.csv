@@ -1,0 +1,9 @@
+source_table,source_version,rule,rule_definition,rows_checked,violating_rows,result
+training.to6_challenge3_inputs.returns_corrected,2,completeness,"return_id, tax_year, income and deduction must all be non-null",12,0,PASS
+training.to6_challenge3_inputs.returns_corrected,2,nonnegative_amounts,income and deduction must be >= 0 (zero is valid),12,0,PASS
+training.to6_challenge3_inputs.returns_corrected,2,tax_year_in_scope,"tax_year must be 2022, 2023 or 2024 so every return lands in exactly one split",12,0,PASS
+training.to6_challenge3_inputs.returns_corrected,2,uniqueness,each return_id must occur exactly once,12,0,PASS
+training.to6_challenge3_inputs.returns_initial,2,completeness,"return_id, tax_year, income and deduction must all be non-null",13,1,FAIL
+training.to6_challenge3_inputs.returns_initial,2,nonnegative_amounts,income and deduction must be >= 0 (zero is valid),13,0,PASS
+training.to6_challenge3_inputs.returns_initial,2,tax_year_in_scope,"tax_year must be 2022, 2023 or 2024 so every return lands in exactly one split",13,0,PASS
+training.to6_challenge3_inputs.returns_initial,2,uniqueness,each return_id must occur exactly once,13,2,FAIL
