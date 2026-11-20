@@ -1,0 +1,16 @@
+[
+  {
+    "run_id": "b50f9b1b1084",
+    "run_at": "2026-11-20T16:28:12+00:00",
+    "notebook_url": "https://dbc-48a16403-f66f.cloud.databricks.com/editor/notebooks/127024866558906",
+    "source_version": 2,
+    "rows": 24
+  },
+  {
+    "run_id": "6a5d3e526a78",
+    "run_at": "2026-11-20T16:38:37+00:00",
+    "notebook_url": "https://dbc-48a16403-f66f.cloud.databricks.com/editor/notebooks/127024866558906",
+    "source_version": 2,
+    "rows": 24
+  }
+]

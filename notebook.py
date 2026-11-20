@@ -383,7 +383,88 @@ display(spark.table(CHECK_RESULTS_TABLE).orderBy("source_table", "rule"))
 
 # COMMAND ----------
 
-# Your implementation and verification here.
+# DBTITLE 1,3a. Build and save return_features from the accepted batch
+FEATURES_TABLE = f"{OUTPUT_SCHEMA}.return_features"
+FEATURE_COLUMNS = ["return_id", "tax_year", "deduction_to_income"]
+
+# Built only from accepted_returns: the corrected batch at the version the gate checked in 2d.
+# Ratio = deduction / income; null when income = 0 (the return is kept, the ratio is undefined).
+# taxpayer_id, income and deduction are not selected (need-to-know).
+features_df = accepted_returns.select(
+    "return_id",
+    "tax_year",
+    F.when(F.col("income") == 0, F.lit(None).cast("double"))
+     .otherwise(F.col("deduction").cast("double") / F.col("income").cast("double"))
+     .alias("deduction_to_income"),
+)
+assert features_df.columns == FEATURE_COLUMNS, features_df.columns
+
+# Overwrite (not append) so a rerun replaces the table instead of adding copies
+features_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(FEATURES_TABLE)
+print(f"Saved {FEATURES_TABLE} from {CORRECTED_TABLE} version {accepted_version}")
+
+# COMMAND ----------
+
+# DBTITLE 1,3b. Read back return_features and verify against the source
+import math
+
+# Read the SAVED table back (not the in-memory DataFrame)
+saved_features = spark.table(FEATURES_TABLE)
+
+# 1. Exact columns and types; no filer identifier or raw amounts
+assert saved_features.columns == FEATURE_COLUMNS, saved_features.columns
+assert dict(saved_features.dtypes) == {"return_id": "string", "tax_year": "int", "deduction_to_income": "double"}, saved_features.dtypes
+
+# 2. Every accepted return exactly once (same ID set as the checked source, no extras, no copies)
+saved_rows = {r["return_id"]: r for r in saved_features.collect()}
+source_rows = {r["return_id"]: r for r in accepted_returns.collect()}
+assert saved_features.count() == len(saved_rows) == len(source_rows), "row count / uniqueness mismatch"
+assert set(saved_rows) == set(source_rows), "return_id sets differ"
+
+# 3. Independent recomputation in plain Python from the source amounts, row by row
+for rid, src in source_rows.items():
+    got = saved_rows[rid]
+    assert got["tax_year"] == src["tax_year"], rid
+    if src["income"] == 0:
+        assert got["deduction_to_income"] is None, f"{rid}: zero income must give a null ratio"
+    else:
+        assert math.isclose(got["deduction_to_income"], src["deduction"] / src["income"], rel_tol=1e-12), rid
+
+# 4. Spot check a nonzero case against a value derived by hand from the source row
+r01_src = source_rows["R01"]
+expected_r01 = r01_src["deduction"] / r01_src["income"]
+assert (r01_src["income"], r01_src["deduction"]) == (100, 20) and expected_r01 == 0.2
+assert math.isclose(saved_rows["R01"]["deduction_to_income"], 0.2, rel_tol=1e-12)
+
+# 5. Zero-income returns are kept with a null ratio; no other nulls
+zero_income_ids = sorted(rid for rid, s in source_rows.items() if s["income"] == 0)
+null_ratio_ids = sorted(rid for rid, r in saved_rows.items() if r["deduction_to_income"] is None)
+assert zero_income_ids == null_ratio_ids and len(zero_income_ids) > 0, (zero_income_ids, null_ratio_ids)
+
+print({
+    "rows": len(saved_rows),
+    "R01 expected (20/100)": expected_r01,
+    "R01 saved": saved_rows["R01"]["deduction_to_income"],
+    "zero-income returns with null ratio": null_ratio_ids,
+})
+display(saved_features.orderBy("tax_year", "return_id"))
+
+# COMMAND ----------
+
+# DBTITLE 1,3c. Feature table contract and verification
+# MAGIC %md
+# MAGIC ### Feature table: `return_features`
+# MAGIC * **Source:** `accepted_returns`, which is `returns_corrected` at the Delta version the gate checked in 2d (version 2 in this run). The rejected initial batch is never read here.
+# MAGIC * **Columns:** exactly `return_id` (string), `tax_year` (int) and `deduction_to_income` (double). `taxpayer_id`, `income` and `deduction` are left out under the need-to-know rule.
+# MAGIC * **Ratio:** `deduction_to_income = deduction / income`. When income is 0, the ratio is null and the return stays in the table.
+# MAGIC * **Writes:** each run replaces the table rather than adding to it, so a rerun doesn't leave extra copies.
+# MAGIC
+# MAGIC **What cell 3b checks on the saved table (read back, not the in-memory DataFrame):**
+# MAGIC * The columns and types are exactly as listed above.
+# MAGIC * There are 12 rows and 12 distinct `return_id`s, the same ID set as the accepted source, with no extras or copies.
+# MAGIC * Every ratio matches `deduction / income` recomputed in plain Python from the source amounts, and every `tax_year` matches.
+# MAGIC * **Nonzero case:** R01 has income 100 and deduction 20 in the source, so the expected ratio is 20 / 100 = 0.2. The saved value is 0.2.
+# MAGIC * **Zero-income case:** R03 (2022) and R09 (2024) are both present with a null ratio. They are the only nulls.
 
 # COMMAND ----------
 
@@ -394,4 +475,253 @@ display(spark.table(CHECK_RESULTS_TABLE).orderBy("source_table", "rule"))
 
 # COMMAND ----------
 
-# Your implementation, rerun comparison and exports here.
+# DBTITLE 1,4a. Save year split tables from the saved features
+SPLIT_TABLES = {
+    2022: f"{OUTPUT_SCHEMA}.features_train",
+    2023: f"{OUTPUT_SCHEMA}.features_validation",
+    2024: f"{OUTPUT_SCHEMA}.features_test",
+}
+assert set(SPLIT_TABLES) == set(TAX_YEARS), "every in-scope year needs exactly one split table"
+
+# Splits are read from the SAVED feature table, not the in-memory DataFrame.
+# Overwrite (not append) so a rerun replaces each table instead of adding copies.
+features_saved = spark.table(FEATURES_TABLE)
+for year, table in SPLIT_TABLES.items():
+    (features_saved.where(F.col("tax_year") == year)
+        .write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(table))
+    print(f"Saved {table} (tax_year {year})")
+
+# COMMAND ----------
+
+# DBTITLE 1,4b. Read back splits: year assignment and exactly-once coverage
+from functools import reduce
+
+split_frames = []
+for year, table in SPLIT_TABLES.items():
+    t = spark.table(table)
+    assert t.columns == FEATURE_COLUMNS, (table, t.columns)
+    wrong_year = t.where(~F.col("tax_year").eqNullSafe(F.lit(year))).count()
+    assert wrong_year == 0, f"{table}: {wrong_year} rows not in tax_year {year}"
+    split_frames.append(t.withColumn("split_table", F.lit(table)))
+all_splits = reduce(lambda a, b: a.unionByName(b), split_frames)
+
+# Each return_id appears in exactly one split, once
+multi = all_splits.groupBy("return_id").count().where("count > 1").count()
+assert multi == 0, f"{multi} return_ids appear more than once across splits"
+
+# Splits together hold exactly the saved feature rows: same IDs and values, nothing missing or extra
+split_values = all_splits.drop("split_table")
+missing_from_splits = features_saved.exceptAll(split_values).count()
+extra_in_splits = split_values.exceptAll(features_saved).count()
+assert missing_from_splits == 0 and extra_in_splits == 0, (missing_from_splits, extra_in_splits)
+assert all_splits.count() == features_saved.count() == accepted_returns.count()
+
+display(all_splits.groupBy("split_table", "tax_year").agg(
+    F.count("*").alias("rows"),
+    F.countDistinct("return_id").alias("distinct_return_ids"),
+    F.sum(F.col("deduction_to_income").isNull().cast("int")).alias("null_ratio_rows"),
+).orderBy("tax_year"))
+
+# COMMAND ----------
+
+# DBTITLE 1,4c. Record this run's IDs and values as evidence
+import uuid
+from datetime import datetime, timezone
+
+RUN_SNAPSHOTS_TABLE = f"{OUTPUT_SCHEMA}.run_snapshots"
+
+
+def _ctx_value(getter):
+    try:
+        opt = getter()
+        return opt.get() if opt.isDefined() else None
+    except Exception:
+        return None
+
+
+_ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+NOTEBOOK_ID = _ctx_value(_ctx.notebookId)
+_host = _ctx_value(_ctx.browserHostName) or spark.conf.get("spark.databricks.workspaceUrl", None)
+NOTEBOOK_URL = f"https://{_host}/editor/notebooks/{NOTEBOOK_ID}" if _host and NOTEBOOK_ID else f"notebook id {NOTEBOOK_ID}"
+RUN_ID = uuid.uuid4().hex[:12]
+RUN_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+# Reached only after every check in steps 2-4b passed. Append is intended here:
+# this evidence table keeps one snapshot per complete run (the output tables are overwritten).
+snapshot = reduce(lambda a, b: a.unionByName(b), [
+    spark.table(t).withColumn("table_name", F.lit(t.split(".")[-1]))
+    for t in [FEATURES_TABLE, *SPLIT_TABLES.values()]
+]).select(
+    F.lit(RUN_ID).alias("run_id"), F.lit(RUN_AT).alias("run_at"), F.lit(NOTEBOOK_URL).alias("notebook_url"),
+    F.lit(int(accepted_version)).alias("source_version"), "table_name", *FEATURE_COLUMNS,
+)
+snapshot.write.mode("append").saveAsTable(RUN_SNAPSHOTS_TABLE)
+print({"run_id": RUN_ID, "run_at_utc": RUN_AT, "notebook_url": NOTEBOOK_URL,
+       "rows_recorded": spark.table(RUN_SNAPSHOTS_TABLE).where(F.col("run_id") == RUN_ID).count()})
+
+# COMMAND ----------
+
+# DBTITLE 1,4d. Compare the last two complete runs (IDs and values)
+import json
+
+snap = spark.table(RUN_SNAPSHOTS_TABLE)
+
+# No run may contain a copied row in any table
+dup_in_run = snap.groupBy("run_id", "table_name", "return_id").count().where("count > 1").count()
+assert dup_in_run == 0, f"{dup_in_run} duplicated (run, table, return_id) rows"
+
+runs = (snap.groupBy("run_id", "run_at", "notebook_url", "source_version")
+            .agg(F.count("*").alias("rows")).orderBy(F.col("run_at").desc()).limit(2).collect())
+run_log = [r.asDict() for r in reversed(runs)]  # oldest first
+(REPO_ROOT / "outputs/run_log.json").write_text(json.dumps(run_log, indent=2) + "\n", encoding="utf-8")
+
+if len(runs) < 2:
+    comparison_result = None
+    print("Only one complete run recorded so far. Run the whole notebook again to produce the comparison.")
+else:
+    run_a, run_b = run_log[0]["run_id"], run_log[1]["run_id"]
+    side = lambda rid, sfx: snap.where(F.col("run_id") == rid).select(
+        "table_name", "return_id",
+        F.col("tax_year").alias(f"tax_year_{sfx}"), F.col("deduction_to_income").alias(f"ratio_{sfx}"))
+    comparison = (
+        side(run_a, "run1").join(side(run_b, "run2"), ["table_name", "return_id"], "full_outer")
+        .withColumn("status",
+            F.when(F.col("tax_year_run1").isNull() | F.col("tax_year_run2").isNull(), "missing_in_one_run")
+             .when(~F.col("tax_year_run1").eqNullSafe(F.col("tax_year_run2"))
+                   | ~F.col("ratio_run1").eqNullSafe(F.col("ratio_run2")), "value_differs")
+             .otherwise("identical"))
+        .orderBy("table_name", "return_id")
+    )
+    comparison.toPandas().to_csv(REPO_ROOT / "outputs/run_comparison.csv", index=False)
+    comparison_result = {r["status"]: r["count"] for r in comparison.groupBy("status").count().collect()}
+    display(comparison.groupBy("table_name", "status").count().orderBy("table_name"))
+    assert set(comparison_result) == {"identical"}, comparison_result
+    print(f"Runs {run_a} and {run_b}: {comparison_result['identical']} rows identical across "
+          f"return_features and the three split tables; 0 missing or different")
+
+display(spark.createDataFrame(run_log))
+
+# COMMAND ----------
+
+# DBTITLE 1,4e. Export final tables and run snapshots
+# Small synthetic exports of the saved tables (read back from Catalog, sorted for stable diffs)
+for t in [FEATURES_TABLE, *SPLIT_TABLES.values()]:
+    name = t.split(".")[-1]
+    spark.table(t).orderBy("return_id").toPandas().to_csv(REPO_ROOT / f"outputs/{name}.csv", index=False)
+
+# IDs and values for the two runs that were compared
+kept_runs = [r["run_id"] for r in run_log]
+(snap.where(F.col("run_id").isin(kept_runs))
+     .orderBy("run_at", "table_name", "return_id")
+     .toPandas().to_csv(REPO_ROOT / "outputs/run_snapshots.csv", index=False))
+
+print(sorted(p.name for p in (REPO_ROOT / "outputs").iterdir()))
+
+# COMMAND ----------
+
+# DBTITLE 1,4f. Write SUBMISSION.md handoff
+def _run_line(r):
+    return f"| {r['run_id']} | {r['run_at']} | {r['notebook_url']} | {r['source_version']} | {r['rows']} |"
+
+split_counts = {t.split('.')[-1]: spark.table(t).count() for t in SPLIT_TABLES.values()}
+
+# Initial rejection reference, read from the saved rejection evidence (re-made in every complete run)
+_session_tz = spark.conf.get("spark.sql.session.timeZone")
+_rej = spark.table(REJECTIONS_TABLE).agg(
+    F.date_format(F.max("checked_at"), "yyyy-MM-dd HH:mm:ss").alias("checked_at"),
+    F.max("source_version").alias("source_version"),
+    F.count("*").alias("rows"),
+).first()
+rejection_ref = (
+    f"rejected at {_rej['checked_at']} ({_session_tz}) in run {RUN_ID}, notebook {NOTEBOOK_URL}; "
+    f"`{INITIAL_TABLE}` version {_rej['source_version']}, {_rej['rows']} affected record rows "
+    f"saved in `{REJECTIONS_TABLE}` (the rejection is repeated with the same rules in every complete run)"
+)
+comparison_text = (
+    f"All {comparison_result['identical']} (table, return_id) rows are identical between the two runs "
+    "(status `identical`; 0 `missing_in_one_run`, 0 `value_differs`)."
+    if comparison_result else "Second complete run not yet recorded; comparison pending."
+)
+
+submission = f"""# My dataset submission
+
+This file was generated by cell 4f of `notebook.py` from the saved tables. README.md is still the course navigation page.
+
+## Inputs and outputs
+
+**Inputs (read-only)**
+* `{INITIAL_TABLE}`: initial delivery, rejected.
+* `{CORRECTED_TABLE}`: replacement delivery, accepted at Delta version {accepted_version}.
+* Lineage view `{LINEAGE_VIEW}`: both deliveries were built by SQL from `{INPUT_SCHEMA}.parsed_source`.
+
+**One row** is one tax return. `return_id` identifies the return and must occur exactly once. `taxpayer_id` identifies the filer, who can have returns in several years.
+
+**Outputs**
+* `{FEATURES_TABLE}`: `return_id`, `tax_year`, `deduction_to_income`. {features_saved.count()} rows.
+* `{SPLIT_TABLES[2022]}` (2022): the same columns, {split_counts['features_train']} rows.
+* `{SPLIT_TABLES[2023]}` (2023): the same columns, {split_counts['features_validation']} rows.
+* `{SPLIT_TABLES[2024]}` (2024): the same columns, {split_counts['features_test']} rows.
+* Evidence tables: `{REJECTIONS_TABLE}`, `{CHECK_RESULTS_TABLE}`, `{RUN_SNAPSHOTS_TABLE}`.
+
+**Ratio:** `deduction_to_income = deduction / income`. It is null when income = 0, and the return is kept. `taxpayer_id`, `income` and `deduction` are excluded under the need-to-know rule.
+
+## Checks and decisions
+
+* **Source references (step 1):** Catalog table descriptions, the lineage view, five sample rows per batch and a full-batch profile: returns by year, missing required values, duplicate IDs and zero-income records.
+* **Rules (cell 2a):** applied to one pinned Delta version of each batch.
+  * completeness: `return_id`, `tax_year`, `income` and `deduction` are all non-null
+  * uniqueness: each `return_id` occurs once
+  * nonnegative amounts
+  * tax_year in 2022-2024
+* **Initial rejection:** the completeness and uniqueness rules failed.
+  * Rejection reference: {rejection_ref}.
+  * R02 (2022) has a null `income`.
+  * R01 (2022) appears twice.
+  * Affected records and reasons are in `initial_batch_rejections` and `outputs/initial_rejected_records.csv`. Per-rule results are in `outputs/batch_check_results.csv`.
+  * The gate raises `BatchRejected` for this batch (cell 2c), so no features are built from it. No record was dropped, deduplicated or zero-filled.
+* **Replacement:** `returns_corrected` passes all four rules: 12 rows, 12 distinct IDs.
+* **Nonzero expected value:** in the source, R01 has income 100 and deduction 20, so the expected ratio is 20 / 100 = 0.2. The saved value is 0.2. Every other ratio was also recomputed in plain Python from the source amounts and matched.
+* **Saved-table readback (cell 3b):** the columns and types are exact. The table has 12 rows, each accepted return once. The zero-income returns R03 (2022) and R09 (2024) are present with a null ratio and are the only nulls.
+
+## Two successful runs
+
+| Run ID | Execution timestamp (UTC) | Notebook URL | Source version | Rows recorded |
+| --- | --- | --- | --- | --- |
+{chr(10).join(_run_line(r) for r in run_log)}
+
+Each complete run ends by appending the return IDs and values of `return_features` and the three split tables to `run_snapshots` (cell 4c). This only happens after every check has passed. Cell 4d compares the last two runs with a full outer join on (table, return_id), using null-safe equality on `tax_year` and `deduction_to_income`. {comparison_text}
+
+**Evidence files:** `outputs/run_snapshots.csv` (both runs' IDs and values), `outputs/run_comparison.csv` (row-by-row status) and `outputs/run_log.json`.
+
+**Year assignment and exactly-once coverage (cell 4b):**
+* Each split contains only its year.
+* No `return_id` appears in more than one split, or more than once.
+* The splits together equal `return_features` exactly (`exceptAll` in both directions is empty).
+
+**No appended copies:** all output tables are written in overwrite mode. Cell 4d asserts that no run has a duplicated (table, return_id) row, and both runs record the same row counts.
+
+## Final files and limitations
+
+**Final exports in `outputs/`:**
+* `return_features.csv`, `features_train.csv`, `features_validation.csv`, `features_test.csv`
+* `initial_rejected_records.csv`, `batch_check_results.csv`
+* `run_snapshots.csv`, `run_comparison.csv`, `run_log.json`
+
+**Practice file (not part of the task):** `connection-practice.json`.
+
+**Known CI result:** the starter tests were run on 2026-11-20 against an exported SOURCE copy of this notebook saved as `notebook.py`, using `python -m unittest discover -s tests -v` (the same command as `.github/workflows/tests.yml`). 11 of 12 tests pass.
+* `test_browser_scaffold_uses_the_same_authenticated_schema` fails. It executes the whole `notebook.py` with a stub `spark` that only supports `spark.sql(...).first()`.
+* It first stops at `NameError: name 'pwd' is not defined` (cell 2).
+* Run cell by cell against the same stub, the practice cell (`.asDict()`), the setup cell (`dbutils`) and every task cell that reads or writes tables would also fail.
+* The setup cell's schema calculation itself, which is what the test checks, produces an output schema name under the stub.
+* The failure therefore comes from the implemented notebook needing a real Spark session. The data results are not affected.
+
+**Not verified:**
+* The Catalog UI Lineage tab. The supplied lineage view was used instead, and it does not claim a UI check.
+* The contents of `parsed_source` beyond its Catalog description.
+* Model leakage. The same filer (for example F0) has returns in the train, validation and test years. Labels and prediction-time availability are left to later modelling work.
+* Whether the GitHub Actions run on push shows the same single failure. The tests were run in Databricks, not on GitHub's runner.
+* The final GitHub commit contents. They are checked after Commit & Push, and the commit SHA is reported in Classroom, not here.
+"""
+(REPO_ROOT / "SUBMISSION.md").write_text(submission, encoding="utf-8")
+print(submission)
